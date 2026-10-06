@@ -1,0 +1,411 @@
+// ============================================================================
+// The Trident
+// Strategy: 3-step directional state machine — Hull MA + Classic Engulfing
+// Author: Mad52x
+//
+// Engulfing detection: original logic from Engulfing Candles Detector
+//   (inspired by HPotter Bullish and Bearish Engulfing scripts)
+//   Pure body-based — no high/low range requirement
+//
+// LONG PATTERN (BEC1 → BEC2 → BEC3):
+//   BEC1: bullish engulf + close < Hull + Hull RED
+//   BEC2: bullish engulf + low < BEC1.low + close < BEC1.close
+//         Hull must turn GREEN after BEC1 — looking for BEC2 during green cycle
+//         If Hull turns RED again before BEC2 found → RESET
+//   BEC3: bullish engulf + close > BEC2.high + close > Hull + Hull GREEN
+//   → LONG signal on BEC3 close
+//
+// SHORT PATTERN (BEAC1 → BEAC2 → BEAC3):
+//   BEAC1: bearish engulf + close > Hull + Hull GREEN
+//   BEAC2: bearish engulf + high > BEAC1.high
+//          Hull must turn RED after BEAC1 — looking for BEAC2 during red cycle
+//          If Hull turns GREEN again before BEAC2 found → RESET
+//   BEAC3: bearish engulf + close < BEAC2.low + close < Hull + Hull RED
+//   → SHORT signal on BEAC3 close
+//
+// ENTRY  : signal candle close ± entry offset
+// SL     : signal candle low/high ± 1.5 × ATR
+// TP     : 2:1 RR from entry to SL distance
+// ============================================================================
+
+//@version=6
+indicator("The Trident", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// ── Hull MA ──────────────────────────────────────────────────────────────────
+grpHull = "Hull MA — Chart Timeframe"
+hullLen = input.int(55,    "Hull Length",    group=grpHull, minval=1)
+hullSrc = input.source(close, "Source",      group=grpHull)
+
+grpHtf  = "Hull MA — Higher Timeframe"
+showHtf = input.bool(true, "Show HTF Hull", group=grpHtf)
+htfTf   = input.timeframe("60", "HTF Timeframe", group=grpHtf)
+htfLen  = input.int(55,    "HTF Hull Length", group=grpHtf, minval=1)
+
+// ── Engulfing ─────────────────────────────────────────────────────────────────
+grpEng     = "Engulfing Candle Settings"
+showEngulf = input.bool(true,  "Show Engulfing Markers",      group=grpEng)
+colorEngulf = input.bool(false, "Color All Engulfing Candles", group=grpEng,
+              tooltip="Bypass mode: colors every engulfing candle regardless of pattern. Blue = bullish, Purple = bearish.")
+
+// ── Entry / Risk ──────────────────────────────────────────────────────────────
+grpRisk    = "Entry & Risk"
+entryTicks = input.float(0.1, "Entry Offset (% of ATR)", group=grpRisk, step=0.05,
+             tooltip="Entry placed this fraction of ATR away from signal close")
+slMult     = input.float(1.5, "SL ATR Multiplier",       group=grpRisk, step=0.1)
+rrRatio    = input.float(2.0, "TP Reward:Risk",           group=grpRisk, step=0.1)
+atrLen     = input.int(14,    "ATR Period",               group=grpRisk)
+showLines  = input.bool(true, "Show SL / TP Lines",       group=grpRisk)
+lineLen    = input.int(20,    "SL/TP Line Length (bars)", group=grpRisk)
+
+// ── Visual ────────────────────────────────────────────────────────────────────
+grpVis     = "Visual Settings"
+showLabels = input.bool(true,  "Show Signal Labels",                    group=grpVis)
+showStates = input.bool(false, "Mark BEC1 / BEC2 bars on entry signal", group=grpVis,
+             tooltip="When a signal fires, marks the BEC1 (yellow '1') and BEC2 (orange '2') bars that led to it.")
+
+// ============================================================================
+// HULL MA
+// ============================================================================
+hma(src, length) =>
+    ta.wma(2.0 * ta.wma(src, length / 2) - ta.wma(src, length),
+           math.round(math.sqrt(length)))
+
+hull     = hma(hullSrc, hullLen)
+hullPrev = hull[2]
+
+hullGreen = hull > hullPrev
+hullRed   = hull < hullPrev
+
+// HTF Hull
+htfHull  = request.security(syminfo.tickerid, htfTf,
+           hma(close, htfLen), lookahead=barmerge.lookahead_off)
+htfGreen = request.security(syminfo.tickerid, htfTf,
+           hma(close, htfLen) > hma(close, htfLen)[2],
+           lookahead=barmerge.lookahead_off)
+
+// ── Hull plots ────────────────────────────────────────────────────────────────
+hullColor  = hullGreen ? color.lime : color.red
+hullPlot1  = plot(hull,     "Hull",    color=hullColor, linewidth=2)
+hullPlot2  = plot(hullPrev, "Hull[2]", color=hullColor, linewidth=2)
+fill(hullPlot1, hullPlot2,
+     color=hullGreen ? color.new(color.lime, 75) : color.new(color.red, 75))
+
+plot(showHtf ? htfHull : na, "HTF Hull",
+     color=htfGreen ? color.new(color.teal, 0) : color.new(color.maroon, 0),
+     linewidth=2, style=plot.style_stepline)
+
+// ============================================================================
+// ATR
+// ============================================================================
+atr14 = ta.atr(atrLen)
+
+// ============================================================================
+// ENGULFING DETECTION — original Engulfing Candles Detector logic
+// (inspired by HPotter Bullish and Bearish Engulfing scripts)
+// Pure body-based: no high/low range requirement
+// ============================================================================
+
+// Bullish engulfing — all five conditions:
+//   1. open[1] > close[1]  → previous candle is RED
+//   2. close > open        → this candle is GREEN
+//   3. close >= open[1]    → close at or above prev open
+//   4. close[1] >= open    → prev close at or above this open
+//   5. body > prev body    → this body is strictly larger
+bullEngulf = open[1]  > close[1]                    and
+             close    > open                         and
+             close    >= open[1]                     and
+             close[1] >= open                        and
+             (close - open) > (open[1] - close[1])
+
+// Bearish engulfing — mirror:
+//   1. close[1] > open[1]  → previous candle is GREEN
+//   2. open > close        → this candle is RED
+//   3. open >= close[1]    → open at or above prev close
+//   4. open[1] >= close    → prev open at or above this close
+//   5. body > prev body    → this body is strictly larger
+bearEngulf = close[1] > open[1]                     and
+             open     > close                        and
+             open     >= close[1]                    and
+             open[1]  >= close                       and
+             (open - close) > (close[1] - open[1])
+
+// ── Bypass mode: color all engulfing candles ──────────────────────────────────
+barcolor(colorEngulf and bullEngulf ? color.new(color.blue,   0) :
+         colorEngulf and bearEngulf ? color.new(color.purple, 0) : na,
+         title="Engulfing Bar Color")
+
+// Small markers
+plotshape(showEngulf and bullEngulf, "Bull Engulf",
+          shape.triangleup,   location.belowbar,
+          color.new(color.blue,   30), size=size.tiny)
+plotshape(showEngulf and bearEngulf, "Bear Engulf",
+          shape.triangledown, location.abovebar,
+          color.new(color.purple, 30), size=size.tiny)
+
+// ============================================================================
+// STATE MACHINE — LONG PATTERN
+// ============================================================================
+// State 0: looking for BEC1
+// State 1: BEC1 found, Hull was RED — waiting for Hull to turn GREEN
+// State 2: Hull turned GREEN — looking for BEC2 this green cycle
+// State 3: BEC2 found — looking for BEC3
+
+var int   longState    = 0
+var float bec1Close    = na
+var float bec1Low      = na
+var float bec2High     = na
+var float bec2Low      = na
+var bool  longWasGreen = false  // Hull has turned green after BEC1
+
+longSignal = false
+
+// ── Long state machine — single if/else if chain ─────────────────────────────
+// IMPORTANT: all states in one chain so only ONE block fires per bar.
+// Without this, resetting to State 0 and immediately re-entering State 1
+// on the same bar would allow multiple Hull cycles to be survived.
+
+if longState == 0
+    // Looking for BEC1: bullish engulf below Hull, Hull RED
+    if bullEngulf and close < hull and hullRed
+        longState    := 1
+        bec1Close    := close
+        bec1Low      := low
+        longWasGreen := false
+
+else if longState == 1
+    // BEC1 stored, Hull RED — waiting for Hull to turn GREEN
+    if hullGreen
+        longWasGreen := true
+        // Check if this same bar already qualifies as BEC2
+        if bullEngulf and low < bec1Low and close < bec1Close
+            longState := 3   // BEC2 found on Hull color change bar
+            bec2High  := high
+            bec2Low   := low
+        else
+            longState := 2   // open BEC2 search window
+    // Update BEC1 if better candidate appears while still in red
+    else if bullEngulf and close < hull and hullRed
+        bec1Close := close
+        bec1Low   := low
+
+else if longState == 2
+    // Hull cycled GREEN — looking for BEC2, no Hull color restriction
+    // Reset if Hull turns RED before BEC2 found = one green cycle wasted
+    if hullRed
+        longState    := 0
+        bec1Close    := na
+        bec1Low      := na
+        longWasGreen := false
+    else if bullEngulf and low < bec1Low and close < bec1Close
+        longState := 3
+        bec2High  := high
+        bec2Low   := low
+
+else if longState == 3
+    // BEC2 stored — looking for BEC3
+    if hullRed
+        // Hull turned red before BEC3 found → full reset
+        longState    := 0
+        bec1Close    := na
+        bec1Low      := na
+        bec2High     := na
+        bec2Low      := na
+        longWasGreen := false
+    else if bullEngulf and close > bec2High and close > hull and hullGreen
+        longSignal := true
+        longState  := 0
+        bec1Close  := na
+        bec1Low    := na
+        bec2High   := na
+        bec2Low    := na
+
+// ============================================================================
+// STATE MACHINE — SHORT PATTERN
+// ============================================================================
+// State 0: looking for BEAC1
+// State 1: BEAC1 found, Hull was GREEN — waiting for Hull to turn RED
+// State 2: Hull turned RED — looking for BEAC2 this red cycle
+// State 3: BEAC2 found — looking for BEAC3
+
+var int   shortState   = 0
+var float beac1Close   = na
+var float beac1High    = na
+var float beac2Low     = na
+var float beac2High    = na
+var bool  shortWasRed  = false  // Hull has turned red after BEAC1
+
+shortSignal = false
+
+// ── Short state machine — single if/else if chain ────────────────────────────
+if shortState == 0
+    // Looking for BEAC1: bearish engulf above Hull, Hull GREEN
+    if bearEngulf and close > hull and hullGreen
+        shortState  := 1
+        beac1Close  := close
+        beac1High   := high
+        shortWasRed := false
+
+else if shortState == 1
+    // BEAC1 stored, Hull GREEN — waiting for Hull to turn RED
+    if hullRed
+        shortWasRed := true
+        // Check if this same bar already qualifies as BEAC2
+        if bearEngulf and high > beac1High
+            shortState := 3
+            beac2Low   := low
+            beac2High  := high
+        else
+            shortState := 2
+    // Update BEAC1 if better candidate appears while still in green
+    else if bearEngulf and close > hull and hullGreen
+        beac1Close := close
+        beac1High  := high
+
+else if shortState == 2
+    // Hull cycled RED — looking for BEAC2, no Hull color restriction
+    // Reset if Hull turns GREEN before BEAC2 found = one red cycle wasted
+    if hullGreen
+        shortState  := 0
+        beac1Close  := na
+        beac1High   := na
+        shortWasRed := false
+    else if bearEngulf and high > beac1High
+        shortState := 3
+        beac2Low   := low
+        beac2High  := high
+
+else if shortState == 3
+    // BEAC2 stored — looking for BEAC3
+    if hullGreen
+        // Hull turned green before BEAC3 found → full reset
+        shortState  := 0
+        beac1Close  := na
+        beac1High   := na
+        beac2Low    := na
+        beac2High   := na
+        shortWasRed := false
+    else if bearEngulf and close < beac2Low and close < hull and hullRed
+        shortSignal := true
+        shortState  := 0
+        beac1Close  := na
+        beac1High   := na
+        beac2Low    := na
+        beac2High   := na
+
+// ============================================================================
+// ENTRY, SL, TP CALCULATION
+// ============================================================================
+entryOffset = entryTicks * atr14
+
+// Entry: a few ticks from signal candle close
+entryLong  = longSignal  ? close - entryOffset : na
+entryShort = shortSignal ? close + entryOffset : na
+
+// SL: anchored to signal candle extreme + ATR buffer
+slLong  = longSignal  ? low  - slMult * atr14 : na
+slShort = shortSignal ? high + slMult * atr14 : na
+
+// TP: RR ratio × actual SL distance from entry
+tpLong  = longSignal  ? entryLong  + rrRatio * math.abs(entryLong  - slLong)  : na
+tpShort = shortSignal ? entryShort - rrRatio * math.abs(entryShort - slShort) : na
+
+// ============================================================================
+// SIGNAL PLOTS
+// ============================================================================
+plotshape(longSignal,  "LONG Signal",  shape.triangleup,
+          location.belowbar, color.lime, size=size.normal)
+plotshape(shortSignal, "SHORT Signal", shape.triangledown,
+          location.abovebar, color.red,  size=size.normal)
+
+if showLabels and longSignal
+    label.new(bar_index, low - atr14 * 1.5,
+              "▲ LONG\nEntry : " + str.tostring(math.round(entryLong,  2)) +
+              "\nSL    : "       + str.tostring(math.round(slLong,     2)) +
+              "\nTP    : "       + str.tostring(math.round(tpLong,     2)),
+              style=label.style_label_up,
+              color=color.lime, textcolor=color.black, size=size.small)
+
+if showLabels and shortSignal
+    label.new(bar_index, high + atr14 * 1.5,
+              "▼ SHORT\nEntry : " + str.tostring(math.round(entryShort, 2)) +
+              "\nSL    : "        + str.tostring(math.round(slShort,    2)) +
+              "\nTP    : "        + str.tostring(math.round(tpShort,    2)),
+              style=label.style_label_down,
+              color=color.red, textcolor=color.white, size=size.small)
+
+// SL / TP lines
+if showLines and longSignal
+    line.new(bar_index, entryLong,  bar_index + lineLen, entryLong,
+             color=color.new(color.orange, 0), width=1, style=line.style_dashed)
+    line.new(bar_index, slLong,     bar_index + lineLen, slLong,
+             color=color.new(color.red,    0), width=1, style=line.style_dotted)
+    line.new(bar_index, tpLong,     bar_index + lineLen, tpLong,
+             color=color.new(color.lime,   0), width=1, style=line.style_dotted)
+
+if showLines and shortSignal
+    line.new(bar_index, entryShort, bar_index + lineLen, entryShort,
+             color=color.new(color.orange, 0), width=1, style=line.style_dashed)
+    line.new(bar_index, slShort,    bar_index + lineLen, slShort,
+             color=color.new(color.red,    0), width=1, style=line.style_dotted)
+    line.new(bar_index, tpShort,    bar_index + lineLen, tpShort,
+             color=color.new(color.lime,   0), width=1, style=line.style_dotted)
+
+// ============================================================================
+// DEBUG: mark BEC1 and BEC2 bars on signal
+// ============================================================================
+var int longBec1Bar  = na
+var int longBec2Bar  = na
+var int shortBec1Bar = na
+var int shortBec2Bar = na
+
+if longState == 1 and longState[1] != 1
+    longBec1Bar := bar_index
+if longState == 3 and longState[1] != 3
+    longBec2Bar := bar_index
+if shortState == 1 and shortState[1] != 1
+    shortBec1Bar := bar_index
+if shortState == 3 and shortState[1] != 3
+    shortBec2Bar := bar_index
+
+if showStates and longSignal
+    if not na(longBec1Bar)
+        label.new(longBec1Bar, low[bar_index - longBec1Bar] - atr14,
+                  "1", style=label.style_label_up,
+                  color=color.new(color.yellow, 20),
+                  textcolor=color.black, size=size.small)
+    if not na(longBec2Bar)
+        label.new(longBec2Bar, low[bar_index - longBec2Bar] - atr14,
+                  "2", style=label.style_label_up,
+                  color=color.new(color.orange, 20),
+                  textcolor=color.black, size=size.small)
+
+if showStates and shortSignal
+    if not na(shortBec1Bar)
+        label.new(shortBec1Bar, high[bar_index - shortBec1Bar] + atr14,
+                  "1", style=label.style_label_down,
+                  color=color.new(color.yellow, 20),
+                  textcolor=color.black, size=size.small)
+    if not na(shortBec2Bar)
+        label.new(shortBec2Bar, high[bar_index - shortBec2Bar] + atr14,
+                  "2", style=label.style_label_down,
+                  color=color.new(color.orange, 20),
+                  textcolor=color.black, size=size.small)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(longSignal,
+    title   = "The Trident: LONG Signal",
+    message = "The Trident LONG on {{ticker}} {{interval}} — BEC3 confirmed at {{close}}")
+
+alertcondition(shortSignal,
+    title   = "The Trident: SHORT Signal",
+    message = "The Trident SHORT on {{ticker}} {{interval}} — BEAC3 confirmed at {{close}}")
+
+alertcondition(longSignal or shortSignal,
+    title   = "The Trident: Any Signal",
+    message = "The Trident signal on {{ticker}} {{interval}} at {{close}}")
