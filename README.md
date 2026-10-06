@@ -59,24 +59,30 @@ Risk  : Fixed $50 per trade
 
 ## Results
 
-### Baseline (no filter)
-| Metric | Value |
-|---|---|
-| Total trades | 2,523 |
-| Win rate | 32.74% |
-| Profit factor | 0.97 |
-| Max drawdown | -73% (limits disabled) |
-| Trades/month | ~62 |
+### Performance Progression
 
-### With CatBoost ML Filter (threshold=0.525)
-| Metric | Training (2023–2025) | Out-of-Sample (2025–2026) |
-|---|---|---|
-| Total trades | 710 | 203 |
-| Win rate | ~55% | 33.5% |
-| Profit factor | ~2.0 | ~1.1 |
-| Challenge passed | ✅ 3 months | ❌ Not passed (8 months) |
+| Metric | Baseline (no filter) | ML Filter — Full Data | ML Filter — OOS Only |
+|---|---|---|---|
+| Period | Jan 2023 – May 2026 | Jan 2023 – May 2026 | Sep 2025 – May 2026 |
+| Total trades | 2,523 | 913 | 203 |
+| Win rate | 32.74% | **44.36%** | 33.5% |
+| Profit factor | 0.97 ❌ | **1.59** ✅ | ~1.1 |
+| Max drawdown | −73% (limits off) | −13.5% | — |
+| Trades/month | ~62 | ~22 | ~25 |
+| Challenge passed | ❌ | ✅ (train period) | ❌ (8 months) |
 
-**Key finding:** The training period performance was partially driven by the `month` feature encoding specific calendar periods. After removing it and applying TimeSeriesSplit cross-validation, the honest out-of-sample AUC was 0.53 — weak but consistent signal.
+### What the ML filter actually achieved
+
+The strategy alone had **no edge** — a profit factor below 1.0 means it was a losing strategy. The CatBoost classifier turned it into a marginally profitable one:
+
+- **+11.6pp win rate improvement** over baseline (32.7% → 44.4%)
+- **Profit factor went from losing (0.97) to profitable (1.59)**
+- Trade count reduced by 64%, keeping only higher-confidence signals
+- Challenge simulation passed in 3 months on training data
+
+Out-of-sample (Sep 2025 – May 2026), performance degraded — win rate dropped back to 33.5% and the challenge was not passed — but remained above the unfiltered baseline in profit factor terms (~1.1 vs 0.97).
+
+**Key finding:** The initial training result (55% WR, PF ~2.0) was inflated by data leakage through the `month` feature, which encoded calendar periods seen in training. After removing it and applying TimeSeriesSplit cross-validation, the honest CV AUC was 0.53. The model learned a real but weak signal — enough to improve the strategy, not enough to pass a prop firm challenge consistently.
 
 ---
 
